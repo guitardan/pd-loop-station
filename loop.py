@@ -3,12 +3,53 @@ import numpy as np
 import sounddevice as sd
 from threading import Thread
 
-class Loop: # TODO enforce audio length multiples of base loop
+class Loop:
     def __init__(self):
-        self.audio = np.zeros((samplerate * max_loop_duration_s, 2))
+        self.audio = np.ones((samplerate * max_loop_duration_s, 2))
         self.widx = 0
         self.ridx = 0
         self.is_recording = False
+        self.synced_widx = 0
+
+    def set_is_recording(self):
+        self.is_recording = ~self.is_recording
+        if self.is_recording:
+            print(f'recording loop {loop_idx}...')
+        else:
+            print(f'...loop {loop_idx} stopped')
+            self.increment_loop_idx()
+
+    def write(self, indata, n_frames):
+        self.audio[self.widx : self.widx + n_frames] *= indata # TODO apply LPF here instead of output signal
+        if self.ridx == 0: # start of loop
+            self.audio[:len(ramp_up)] *= ramp_up
+        self.widx += n_frames
+        if self.widx  > len(self.audio):
+            raise Exception(f'maximum loop length of {max_loop_duration_s}s exceeded')
+        if is_synced:
+            if loop_idx == 0 :
+                global base_loop_length
+                base_loop_length = self.widx
+                self.synced_widx = self.widx
+            else:
+                self.synced_widx = base_loop_length * int(np.round(self.widx / base_loop_length))
+    
+    def read(self, n_frames):
+        ret = self.audio[self.ridx : self.ridx+n_frames]
+        self.ridx += n_frames
+        self.ridx = self.ridx % (self.synced_widx if is_synced else self.widx)
+        if self.ridx == 0: # end of loop
+            ret[-len(ramp_up):] *= ramp_up[::-1]
+        return ret
+    
+    def increment_loop_idx(self):
+        global loop_idx
+        if loop_idx == n_loop_tracks - 1:
+            print(f'using all {n_loop_tracks} available tracks, overwriting...')
+            loop_idx = 0 
+            loops[loop_idx] = Loop()
+        else:
+            loop_idx += 1
 
 def get_samplerate():
     output_device = sd.query_devices(kind='output')
@@ -22,32 +63,8 @@ def get_samplerate():
 def read_loops(indata_shape, n_frames):
     ret = np.zeros(indata_shape)
     for i in [i for i in range(n_loop_tracks) if loops[i].widx > 0 and not loops[i].is_recording]:
-        ret += loops[i].audio[loops[i].ridx : loops[i].ridx+n_frames]
-        loops[i].ridx += n_frames
-        loops[i].ridx = loops[i].ridx % loops[i].widx
-    return ret
-
-def record_loop(indata, n_frames):
-    loops[loop_idx].audio[
-        loops[loop_idx].widx : loops[loop_idx].widx + n_frames
-        ] = indata # TODO apply LPF here instead of output signal
-    loops[loop_idx].widx += n_frames
-    if loops[loop_idx].widx  > len(loops[loop_idx].audio):
-        raise Exception(f'maximum loop length of {max_loop_duration_s}s exceeded')
-
-def set_recording_flag():
-    global loop_idx
-    loops[loop_idx].is_recording = ~loops[loop_idx].is_recording
-    if loops[loop_idx].is_recording:
-        print(f'recording loop {loop_idx}...')
-    else:
-        print(f'...loop {loop_idx} stopped')
-        if loop_idx == n_loop_tracks - 1:
-            print(f'using all {n_loop_tracks} available loop tracks, overwriting...')
-            loop_idx = 0
-            loops[loop_idx].ridx = loops[loop_idx].widx = 0
-        else:
-            loop_idx += 1   
+        ret += loops[i].read(n_frames)
+    return ret 
 
 outdata1 = np.zeros((2))
 def one_pole_low_pass_filter(indata, outdata):
@@ -59,14 +76,13 @@ def one_pole_low_pass_filter(indata, outdata):
     return outdata
 
 def run_ui():
-    global f_c, alpha
     while True:
         txt = input()
         if txt.casefold() == 'q':
             stream.stop()
             sys.exit(0)
         elif txt == '':
-            set_recording_flag()
+            loops[loop_idx].set_is_recording()
 
 def play_audio():
     with stream:
@@ -76,12 +92,16 @@ def play_audio():
 
 max_loop_duration_s = 30
 n_loop_tracks = 8
-output_gain = 1
+output_gain = 100
 f_c = 1_000
+is_synced = True
+fade_ms = 500
 
-samplerate  = get_samplerate()
+samplerate = get_samplerate()
 omega_c = 2 * np.pi * f_c / samplerate 
 alpha = omega_c / (omega_c + 1)
+ramp_up = np.arange(samplerate * fade_ms * 1e-3)/(samplerate * fade_ms * 1e-3)
+ramp_up = np.stack((ramp_up, ramp_up)).T # stereo
 
 loops = [Loop() for _ in range(n_loop_tracks)]
 loop_idx = 0
@@ -89,12 +109,13 @@ loop_idx = 0
 def callback(indata, outdata, frames, time, status):
     if status:
         print(status)
-    indata = output_gain * (indata + read_loops(indata.shape, frames))
-    outdata = one_pole_low_pass_filter(indata, outdata)
+    tmpdata = output_gain * (indata + read_loops(indata.shape, frames))
+    outdata = one_pole_low_pass_filter(tmpdata, outdata)
     if loops[loop_idx].is_recording:
-        record_loop(indata, frames)
+        loops[loop_idx].write(indata, frames)
 
-stream = sd.Stream(samplerate=samplerate, callback=callback)
+#sys.exit()
+stream = sd.Stream(samplerate=samplerate, callback=callback, latency='low', blocksize=0)
 if __name__ == "__main__":
     Thread(target=play_audio).start()
     Thread(target=run_ui).start()
