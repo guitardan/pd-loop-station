@@ -5,11 +5,11 @@ from threading import Thread
 
 class Loop:
     def __init__(self):
-        self.audio = np.ones((samplerate * max_loop_duration_s, 2))
-        self.widx = 0
-        self.ridx = 0
+        self.audio = np.zeros((samplerate * max_loop_duration_s, 2))
+        self.write_idx = 0
+        self.read_idx = 0
         self.is_recording = False
-        self.synced_widx = 0
+        self.synced_write_idx = 0
 
     def set_is_recording(self):
         self.is_recording = ~self.is_recording
@@ -17,37 +17,46 @@ class Loop:
             print(f'recording loop {loop_idx}...')
         else:
             print(f'...loop {loop_idx} stopped')
+            self.apply_fade_in_out()
             self.increment_loop_idx()
 
     def write(self, indata, n_frames):
-        self.audio[self.widx : self.widx + n_frames] *= indata # TODO apply LPF here instead of output signal
-        if self.ridx == 0: # start of loop
-            self.audio[:len(ramp_up)] *= ramp_up
-        self.widx += n_frames
-        if self.widx  > len(self.audio):
+        self.audio[self.write_idx : self.write_idx + n_frames] = indata # TODO apply LPF here instead of filtering output signal
+        self.write_idx += n_frames
+        if self.write_idx  > len(self.audio):
             raise Exception(f'maximum loop length of {max_loop_duration_s}s exceeded')
         if is_synced:
             if loop_idx == 0 :
                 global base_loop_length
-                base_loop_length = self.widx
-                self.synced_widx = self.widx
+                base_loop_length = self.write_idx
+                self.synced_write_idx = self.write_idx
             else:
-                self.synced_widx = base_loop_length * int(np.round(self.widx / base_loop_length))
+                synced_write_idx = base_loop_length * int(np.round(self.write_idx / base_loop_length))
+                self.synced_write_idx = base_loop_length if synced_write_idx == 0 else synced_write_idx
     
     def read(self, n_frames):
-        ret = self.audio[self.ridx : self.ridx+n_frames]
-        self.ridx += n_frames
-        self.ridx = self.ridx % (self.synced_widx if is_synced else self.widx)
-        if self.ridx == 0: # end of loop
-            ret[-len(ramp_up):] *= ramp_up[::-1]
+        ret = self.audio[self.read_idx : self.read_idx+n_frames]
+        self.read_idx += n_frames
+        self.read_idx = self.read_idx % (self.synced_write_idx if is_synced else self.write_idx)
         return ret
     
+    def apply_fade_in_out(self):
+        n_loop_samples = self.synced_write_idx if is_synced else self.write_idx
+        if n_loop_samples < len(ramp):
+            print(f'{fade_ms}ms fade-in/out longer than loop, reducing fade duration...')
+            tmp_ramp = np.stack((np.arange(n_loop_samples)/(n_loop_samples), np.arange(n_loop_samples)/(n_loop_samples))).T # stereo
+            self.audio[:len(tmp_ramp)] *= tmp_ramp
+            self.audio[:n_loop_samples][-len(tmp_ramp):] *= tmp_ramp[::-1]
+        else:
+            self.audio[:len(ramp)] *= ramp
+            self.audio[:n_loop_samples][-len(ramp):] *= ramp[::-1]
+
     def increment_loop_idx(self):
         global loop_idx
         if loop_idx == n_loop_tracks - 1:
-            print(f'using all {n_loop_tracks} available tracks, overwriting...')
+            print(f'all {n_loop_tracks} available tracks in use, overwriting previous loops...')
             loop_idx = 0 
-            loops[loop_idx] = Loop()
+            loops[loop_idx] = Loop() # TODO don't erase previous loop until recording actually starts
         else:
             loop_idx += 1
 
@@ -62,7 +71,7 @@ def get_samplerate():
 
 def read_loops(indata_shape, n_frames):
     ret = np.zeros(indata_shape)
-    for i in [i for i in range(n_loop_tracks) if loops[i].widx > 0 and not loops[i].is_recording]:
+    for i in [i for i in range(n_loop_tracks) if loops[i].write_idx > 0 and not loops[i].is_recording]:
         ret += loops[i].read(n_frames)
     return ret 
 
@@ -92,37 +101,36 @@ def play_audio():
 
 max_loop_duration_s = 30
 n_loop_tracks = 8
-output_gain = 100
-f_c = 1_000
 is_synced = True
-fade_ms = 500
+output_gain = 1
+fade_ms = 25
+f_c = 1_000
 
 samplerate = get_samplerate()
 omega_c = 2 * np.pi * f_c / samplerate 
 alpha = omega_c / (omega_c + 1)
-ramp_up = np.arange(samplerate * fade_ms * 1e-3)/(samplerate * fade_ms * 1e-3)
-ramp_up = np.stack((ramp_up, ramp_up)).T # stereo
+ramp = np.arange(samplerate * fade_ms * 1e-3)/(samplerate * fade_ms * 1e-3)
+ramp = np.stack((ramp, ramp)).T # stereo
 
-loops = [Loop() for _ in range(n_loop_tracks)]
 loop_idx = 0
+loops = [Loop() for _ in range(n_loop_tracks)]
 
 def callback(indata, outdata, frames, time, status):
     if status:
         print(status)
     tmpdata = output_gain * (indata + read_loops(indata.shape, frames))
-    outdata = one_pole_low_pass_filter(tmpdata, outdata)
+    outdata = one_pole_low_pass_filter(tmpdata, outdata) # provides better de-clicking... but why isn't fade-in/out sufficient?
     if loops[loop_idx].is_recording:
         loops[loop_idx].write(indata, frames)
 
 #sys.exit()
-stream = sd.Stream(samplerate=samplerate, callback=callback, latency='low', blocksize=0)
+stream = sd.Stream(samplerate=samplerate, callback=callback) #, latency='low', blocksize=0)
 if __name__ == "__main__":
     Thread(target=play_audio).start()
     Thread(target=run_ui).start()
 
-def finite_signal_iir_lpf(input, f_c = 1_000):
-    omega_c = 2 * np.pi * f_c / samplerate 
-    alpha = omega_c / (omega_c + 1)
+
+def finite_signal_iir_lpf(input, x1):
     ret = np.zeros(input.shape)
     ret[0] = alpha * input[0]
     for i in range(1, len(input)):
