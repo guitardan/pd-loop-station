@@ -19,9 +19,13 @@ class Loop:
             print(f'...loop {loop_idx} stopped')
             self.apply_fade_in_out()
             self.increment_loop_idx()
+    
+    def lowpass_filtered_write(self, indata, n_frames):
+        for i in range(n_frames):
+            self.audio[self.write_idx + i] = self.audio[self.write_idx + i - 1] + alpha * (indata[i] - self.audio[self.write_idx + i - 1])
 
     def write(self, indata, n_frames):
-        self.audio[self.write_idx : self.write_idx + n_frames] = indata # TODO apply LPF here instead of filtering output signal
+        self.audio[self.write_idx : self.write_idx + n_frames] = indata # self.lowpass_filtered_write(indata, n_frames) # 
         self.write_idx += n_frames
         if self.write_idx  > len(self.audio):
             raise Exception(f'maximum loop length of {max_loop_duration_s}s exceeded')
@@ -41,7 +45,9 @@ class Loop:
         return ret
     
     def apply_fade_in_out(self):
-        n_loop_samples = self.synced_write_idx if is_synced else self.write_idx
+        n_loop_samples = self.write_idx
+        if is_synced and self.synced_write_idx < self.write_idx:
+            n_loop_samples = self.synced_write_idx # only fade at this position if shortening the recorded loop for syncing
         if n_loop_samples < len(ramp):
             print(f'{fade_ms}ms fade-in/out longer than loop, reducing fade duration...')
             tmp_ramp = np.stack((np.arange(n_loop_samples)/(n_loop_samples), np.arange(n_loop_samples)/(n_loop_samples))).T # stereo
@@ -101,7 +107,7 @@ def play_audio():
 
 max_loop_duration_s = 30
 n_loop_tracks = 8
-is_synced = True
+is_synced = True # False # 
 output_gain = 1
 fade_ms = 25
 f_c = 1_000
@@ -118,8 +124,8 @@ loops = [Loop() for _ in range(n_loop_tracks)]
 def callback(indata, outdata, frames, time, status):
     if status:
         print(status)
-    tmpdata = output_gain * (indata + read_loops(indata.shape, frames))
-    outdata = one_pole_low_pass_filter(tmpdata, outdata) # provides better de-clicking... but why isn't fade-in/out sufficient?
+    outdata[:] = output_gain * (indata + read_loops(indata.shape, frames)) # tmpdata = output_gain * (indata + read_loops(indata.shape, frames))
+    #outdata = one_pole_low_pass_filter(tmpdata, outdata) # provides better de-clicking... but why isn't fade-in/out sufficient? syncing caused fades to start at wrong position
     if loops[loop_idx].is_recording:
         loops[loop_idx].write(indata, frames)
 
