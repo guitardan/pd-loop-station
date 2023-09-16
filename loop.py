@@ -1,4 +1,4 @@
-import sys
+import sys, mido
 import numpy as np
 import soundfile as sf
 import sounddevice as sd
@@ -104,6 +104,16 @@ def run_ui():
             is_recording_output = ~is_recording_output
             print('storing audio...' if is_recording_output else '...writing stored audio to file')
 
+def listen_for_midi():
+    input_names = mido.get_input_names()
+    print(f'using midi device {input_names[1]}')
+    t_received = perf_counter()
+    with mido.open_input(input_names[1]) as port:
+        for _ in port:
+            if perf_counter() - t_received > 0.01:
+                t_received = perf_counter()
+                loops[loop_idx].set_is_recording()
+
 def play_audio():
     with stream: 
         while True:
@@ -150,7 +160,7 @@ stream = sd.Stream(device=device_idx, channels=n_channels, samplerate=samplerate
 if __name__ == "__main__":
     Thread(target=play_audio).start()
     Thread(target=run_ui).start()
-
+    Thread(target=listen_for_midi).start()
 
 def finite_signal_iir_lpf(input, x1):
     ret = np.zeros(input.shape)
