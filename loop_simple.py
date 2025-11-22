@@ -24,22 +24,6 @@ class AudioBuffer:
             self.ridx = 0
         return ret
 
-# # Cross-correlation stuff that was probably for pitch detection, but never fully implemented
-# def corr(x, h):
-#     ret = 0
-#     for i in range(len(x)-len(h)+1):
-#         ret += (np.dot(h, x[i:i+len(h)]))**2
-#     return ret
-
-# def get_corr_kernels(f0 = 880, n_cycles = 10):
-#     f0s = [f0*(2**(1/12))**i for i in range(12)]
-#     kernels = []
-#     for f in f0s:
-#         t_f = n_cycles/f
-#         t = np.arange(t_f*samplerate)/samplerate
-#         y = np.sin(2 * np.pi * f * t)
-#         kernels.append(y)
-
 def get_samplerate():
     output_device = sd.query_devices(kind='output')
     try:
@@ -64,9 +48,10 @@ def callback(indata, outdata, frames, time, status):
     
     if is_recording:
         loops[loop_idx].write(indata)
-        outdata[:] = indata
-    else:
-        outdata[:] = indata + loops[loop_idx].read(frames)
+
+    outdata[:] = indata
+    for loop in loops:
+        outdata[:] += loop.read(frames)
 
 stream = sd.Stream(callback=callback)
 def run_ui():
@@ -87,8 +72,9 @@ def run_ui():
             else:
                 print('STOPPING')
         elif txt == ' ':
+            loops.append(AudioBuffer(samplerate, indata_shape, max_duration_sec=60))
+            print(f'LOOP ADDED, TOTAL LOOPS: {len(loops)}')
             loop_idx += 1
-            print(f'LOOP INDEX: {loop_idx}')
 
 def play_audio():
     with stream:
